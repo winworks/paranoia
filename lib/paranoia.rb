@@ -12,7 +12,12 @@ module Paranoia
     end
 
     def only_deleted
-      with_deleted.where.not(paranoia_column => nil)
+      case paranoia_column_type
+      when :datetime
+        with_deleted.where.not(paranoia_column => nil)
+      when :boolean
+        with_deleted.where(paranoia_column => true)
+      end
     end
     alias :deleted :only_deleted
 
@@ -53,7 +58,12 @@ module Paranoia
   end
 
   def restore!
-    run_callbacks(:restore) { update_column paranoia_column, nil }
+    case paranoia_column_type
+    when :datetime
+      run_callbacks(:restore) { update_column paranoia_column, nil }
+    when :boolean
+      run_callbacks(:restore) { update_column paranoia_column, false }
+    end
   end
 
   def destroyed?
@@ -72,10 +82,19 @@ module Paranoia
   # insert time to paranoia column.
   # @param with_transaction [Boolean] exec with ActiveRecord Transactions.
   def touch_paranoia_column(with_transaction=false)
-    if with_transaction
-      with_transaction_returning_status { touch(paranoia_column) }
-    else
-      touch(paranoia_column)
+    case paranoia_column_type
+    when :datetime
+      if with_transaction
+        with_transaction_returning_status { touch(paranoia_column) }
+      else
+        touch(paranoia_column)
+      end
+    when :boolean
+      if with_transaction
+        with_transaction_returning_status { update_column(paranoia_column, true) }
+      else
+        update_column(paranoia_column, true)
+      end
     end
   end
 end
@@ -85,10 +104,19 @@ class ActiveRecord::Base
     alias :destroy! :destroy
     alias :delete!  :delete
     include Paranoia
-    class_attribute :paranoia_column
+    class_attribute :paranoia_column, :paranoia_column_type
 
     self.paranoia_column = options[:column] || :deleted_at
-    default_scope { where(self.quoted_table_name + ".#{paranoia_column} IS NULL") }
+    self.paranoia_column_type = options[:column_type] || :datetime
+
+    case paranoia_column_type
+    when :datetime
+      default_scope { where(self.quoted_table_name + ".#{paranoia_column} IS NULL") }
+    when :boolean
+      default_scope { where(paranoia_column => false) }
+    else
+      raise ArgumentError, "invalid paranoia_column_type: #{paranoia_column_type.inspect}"
+    end
   end
 
   def self.paranoid? ; false ; end
@@ -105,5 +133,9 @@ class ActiveRecord::Base
 
   def paranoia_column
     self.class.paranoia_column
+  end
+
+  def paranoia_column_type
+    self.class.paranoia_column_type
   end
 end
