@@ -1,25 +1,35 @@
-require 'test/unit'
 require 'active_record'
+
+test_framework = if ActiveRecord::VERSION::STRING >= "4.1"
+  require 'minitest/autorun'
+  MiniTest::Test
+else
+  require 'test/unit'
+  Test::Unit::TestCase
+end
 require File.expand_path(File.dirname(__FILE__) + "/../lib/paranoia")
 
-DB_FILE = 'tmp/test_db'
-
-FileUtils.mkdir_p File.dirname(DB_FILE)
-FileUtils.rm_f DB_FILE
-
-ActiveRecord::Base.establish_connection :adapter => 'sqlite3', :database => DB_FILE
+ActiveRecord::Base.establish_connection :adapter => 'sqlite3', database: ':memory:'
 ActiveRecord::Base.connection.execute 'CREATE TABLE parent_models (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE paranoid_models (id INTEGER NOT NULL PRIMARY KEY, parent_model_id INTEGER, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE featureful_models (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME, name VARCHAR(32))'
 ActiveRecord::Base.connection.execute 'CREATE TABLE plain_models (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE callback_models (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
+ActiveRecord::Base.connection.execute 'CREATE TABLE fail_callback_models (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE related_models (id INTEGER NOT NULL PRIMARY KEY, parent_model_id INTEGER NOT NULL, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE employers (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE employees (id INTEGER NOT NULL PRIMARY KEY, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE jobs (id INTEGER NOT NULL PRIMARY KEY, employer_id INTEGER NOT NULL, employee_id INTEGER NOT NULL, deleted_at DATETIME)'
 ActiveRecord::Base.connection.execute 'CREATE TABLE custom_column_models (id INTEGER NOT NULL PRIMARY KEY, destroyed_at DATETIME)'
+ActiveRecord::Base.connection.execute 'CREATE TABLE non_paranoid_models (id INTEGER NOT NULL PRIMARY KEY, parent_model_id INTEGER)'
 
-class ParanoiaTest < Test::Unit::TestCase
+class ParanoiaTest < test_framework
+  def setup
+    ActiveRecord::Base.connection.tables.each do |table|
+      ActiveRecord::Base.connection.execute "DELETE FROM #{table}"
+    end
+  end
+
   def test_plain_model_class_is_not_paranoid
     assert_equal false, PlainModel.paranoid?
   end
@@ -43,7 +53,7 @@ class ParanoiaTest < Test::Unit::TestCase
 
     model.destroy
 
-    assert_not_equal nil, model.to_param
+    assert model.to_param
     assert_equal to_param, model.to_param
   end
 
@@ -105,7 +115,6 @@ class ParanoiaTest < Test::Unit::TestCase
   end
 
   def test_scoping_behavior_for_paranoid_models
-    ParanoidModel.unscoped.delete_all
     parent1 = ParentModel.create
     parent2 = ParentModel.create
     p1 = ParanoidModel.create(:parent_model => parent1)
@@ -238,13 +247,28 @@ class ParanoiaTest < Test::Unit::TestCase
     assert_equal false, model.destroyed?
   end
 
+  # Regression test for #92
   def test_destroy_twice
     model = ParanoidModel.new
     model.save
     model.destroy
     model.destroy
 
-    assert_equal 0, ParanoidModel.unscoped.where(id: model.id).count
+    assert_equal 1, ParanoidModel.unscoped.where(id: model.id).count
+  end
+
+  def test_destroy_return_value_on_success
+    model = ParanoidModel.create
+    return_value = model.destroy
+
+    assert_equal(return_value, model)
+  end
+
+  def test_destroy_return_value_on_failure
+    model = FailCallbackModel.create
+    return_value = model.destroy
+
+    assert_equal(return_value, false)
   end
 
   def test_restore_behavior_for_callbacks
@@ -265,9 +289,17 @@ class ParanoiaTest < Test::Unit::TestCase
   def test_real_destroy
     model = ParanoidModel.new
     model.save
-    model.destroy!
-
+    model.really_destroy!
     refute ParanoidModel.unscoped.exists?(model.id)
+  end
+
+  if ActiveRecord::VERSION::STRING < "4.1"
+    def test_real_destroy
+      model = ParanoidModel.new
+      model.save
+      model.destroy!
+      refute ParanoidModel.unscoped.exists?(model.id)
+    end
   end
 
   def test_real_delete
@@ -305,6 +337,59 @@ class ParanoiaTest < Test::Unit::TestCase
     refute c.destroyed?
   end
 
+  def test_restore_with_associations
+    parent = ParentModel.create
+    first_child = parent.very_related_models.create
+    second_child = parent.non_paranoid_models.create
+
+    parent.destroy
+    assert_equal false, parent.deleted_at.nil?
+    assert_equal false, first_child.reload.deleted_at.nil?
+    assert_equal true, second_child.destroyed?
+
+    parent.restore!
+    assert_equal true, parent.deleted_at.nil?
+    assert_equal false, first_child.reload.deleted_at.nil?
+    assert_equal true, second_child.destroyed?
+
+    parent.destroy
+    parent.restore(:recursive => true)
+    assert_equal true, parent.deleted_at.nil?
+    assert_equal true, first_child.reload.deleted_at.nil?
+    assert_equal true, second_child.destroyed?
+
+    parent.destroy
+    ParentModel.restore(parent.id, :recursive => true)
+    assert_equal true, parent.reload.deleted_at.nil?
+    assert_equal true, first_child.reload.deleted_at.nil?
+    assert_equal true, second_child.destroyed?
+  end
+
+  def test_observers_notified
+    a = ParanoidModelWithObservers.create
+    a.destroy
+    a.restore!
+
+    assert a.observers_notified.select {|args| args == [:before_restore, a]}
+    assert a.observers_notified.select {|args| args == [:after_restore, a]}
+  end
+
+  def test_observers_not_notified_if_not_supported
+    a = ParanoidModelWithObservers.create
+    a.destroy
+    a.restore!
+    # essentially, we're just ensuring that this doesn't crash
+  end
+
+  def test_i_am_the_destroyer
+    output = capture(:stdout) { ParanoidModel.I_AM_THE_DESTROYER! }
+    assert_equal %Q{
+      Sharon: "There should be a method called I_AM_THE_DESTROYER!"
+      Ryan:   "What should this method do?"
+      Sharon: "It should fix all the spelling errors on the page!"
+}, output
+  end
+
   private
   def get_featureful_model
     FeaturefulModel.new(:name => "not empty")
@@ -313,13 +398,16 @@ end
 
 # Helper classes
 
-class ParentModel < ActiveRecord::Base
-  has_many :paranoid_models
-end
-
 class ParanoidModel < ActiveRecord::Base
   belongs_to :parent_model
   acts_as_paranoid
+end
+
+class FailCallbackModel < ActiveRecord::Base
+  belongs_to :parent_model
+  acts_as_paranoid
+
+  before_destroy { |_| false }
 end
 
 class FeaturefulModel < ActiveRecord::Base
@@ -349,7 +437,10 @@ end
 
 class ParentModel < ActiveRecord::Base
   acts_as_paranoid
+  has_many :paranoid_models
   has_many :related_models
+  has_many :very_related_models, :class_name => 'RelatedModel', dependent: :destroy
+  has_many :non_paranoid_models, dependent: :destroy
 end
 
 class RelatedModel < ActiveRecord::Base
@@ -377,4 +468,21 @@ end
 
 class CustomColumnModel < ActiveRecord::Base
   acts_as_paranoid column: :destroyed_at
+end
+
+class NonParanoidModel < ActiveRecord::Base
+end
+
+class ParanoidModelWithObservers < ParanoidModel
+  def observers_notified
+    @observers_notified ||= []
+  end
+
+  def self.notify_observer(*args)
+    observers_notified << args
+  end
+end
+
+class ParanoidModelWithoutObservers < ParanoidModel
+  self.class.send(remove_method :notify_observers) if method_defined?(:notify_observers)
 end

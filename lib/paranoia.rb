@@ -8,7 +8,11 @@ module Paranoia
     def paranoid? ; true ; end
 
     def with_deleted
-      all.tap { |x| x.default_scoped = false }
+      if ActiveRecord::VERSION::STRING >= "4.1"
+        unscope where: paranoia_column
+      else
+        all.tap { |x| x.default_scoped = false }
+      end
     end
 
     def only_deleted
@@ -21,11 +25,11 @@ module Paranoia
     end
     alias :deleted :only_deleted
 
-    def restore(id)
+    def restore(id, opts = {})
       if id.is_a?(Array)
-        id.map { |one_id| restore(one_id) }
+        id.map { |one_id| restore(one_id, opts) }
       else
-        only_deleted.find(id).restore!
+        only_deleted.find(id).restore!(opts)
       end
     end
   end
@@ -49,22 +53,39 @@ module Paranoia
   end
 
   def destroy
-    run_callbacks(:destroy) { delete_or_soft_delete(true) }
+    callbacks_result = run_callbacks(:destroy) { touch_paranoia_column(true) }
+    callbacks_result ? self : false
+  end
+
+  # As of Rails 4.1.0 +destroy!+ will no longer remove the record from the db
+  # unless you touch the paranoia column before.
+  # We need to override it here otherwise children records might be removed
+  # when they shouldn't
+  if ActiveRecord::VERSION::STRING >= "4.1"
+    def destroy!
+      destroyed? ? super : destroy || raise(ActiveRecord::RecordNotDestroyed)
+    end
   end
 
   def delete
     return if new_record?
-    delete_or_soft_delete
+    touch_paranoia_column(false)
   end
 
-  def restore!
-    case paranoia_column_type
-    when :datetime
-      run_callbacks(:restore) { update_column paranoia_column, nil }
-    when :boolean
-      run_callbacks(:restore) { update_column paranoia_column, false }
+  def restore!(opts = {})
+    ActiveRecord::Base.transaction do
+      run_callbacks(:restore) do
+        case paranoia_column_type
+        when :datetime
+          update_column paranoia_column, nil
+        when :boolean
+          update_column paranoia_column, false
+        end
+        restore_associated_records if opts[:recursive]
+      end
     end
   end
+  alias :restore :restore!
 
   def destroyed?
     !!send(paranoia_column)
@@ -72,11 +93,6 @@ module Paranoia
   alias :deleted? :destroyed?
 
   private
-  # select and exec delete or soft-delete.
-  # @param with_transaction [Boolean] exec with ActiveRecord Transactions, when soft-delete.
-  def delete_or_soft_delete(with_transaction=false)
-    destroyed? ? destroy! : touch_paranoia_column(with_transaction)
-  end
 
   # touch paranoia column.
   # insert time to paranoia column.
@@ -97,12 +113,29 @@ module Paranoia
       end
     end
   end
+
+  # restore associated records that have been soft deleted when
+  # we called #destroy
+  def restore_associated_records
+    destroyed_associations = self.class.reflect_on_all_associations.select do |association|
+      association.options[:dependent] == :destroy
+    end
+
+    destroyed_associations.each do |association|
+      association = send(association.name)
+
+      if association.paranoid?
+        association.only_deleted.each { |record| record.restore(:recursive => true) }
+      end
+    end
+  end
 end
 
 class ActiveRecord::Base
   def self.acts_as_paranoid(options={})
+    alias :really_destroy! :destroy
     alias :destroy! :destroy
-    alias :delete!  :delete
+    alias :delete! :delete
     include Paranoia
     class_attribute :paranoia_column, :paranoia_column_type
 
@@ -111,12 +144,30 @@ class ActiveRecord::Base
 
     case paranoia_column_type
     when :datetime
-      default_scope { where(self.quoted_table_name + ".#{paranoia_column} IS NULL") }
+      default_scope { where(paranoia_column => nil) }
     when :boolean
       default_scope { where(paranoia_column => false) }
     else
       raise ArgumentError, "invalid paranoia_column_type: #{paranoia_column_type.inspect}"
     end
+
+    before_restore {
+      self.class.notify_observers(:before_restore, self) if self.class.respond_to?(:notify_observers)
+    }
+    after_restore {
+      self.class.notify_observers(:after_restore, self) if self.class.respond_to?(:notify_observers)
+    }
+  end
+
+  # Please do not use this method in production.
+  # Pretty please.
+  def self.I_AM_THE_DESTROYER!
+    # TODO: actually implement spelling error fixes
+    puts %Q{
+      Sharon: "There should be a method called I_AM_THE_DESTROYER!"
+      Ryan:   "What should this method do?"
+      Sharon: "It should fix all the spelling errors on the page!"
+}
   end
 
   def self.paranoid? ; false ; end
